@@ -1,0 +1,308 @@
+import cv2
+import numpy as np
+import json
+from datetime import datetime
+
+
+class BleedingDetectorNoPyTorch:
+    def __init__(self):
+        # Stores red area values over time
+        self.red_area_history = []
+
+        # Alert rule: >30% increase over 2 seconds
+        self.increase_threshold = 0.30
+
+        # Minimum red area ratio to avoid tiny false positives
+        self.min_red_area_ratio = 0.01
+
+    def detect_red_area(self, frame):
+        """
+        1) Convert frame to HSV color space.
+        2) Define red color range using two HSV ranges.
+        3) Compute red area.
+        """
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Red range 1: lower hue reds
+        lower_red_1 = np.array([0, 80, 80])
+        upper_red_1 = np.array([10, 255, 255])
+
+        # Red range 2: upper hue reds
+        lower_red_2 = np.array([170, 80, 80])
+        upper_red_2 = np.array([180, 255, 255])
+
+        mask1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
+        mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
+
+        red_mask = mask1 + mask2
+
+        # Clean the mask to reduce noise
+        kernel = np.ones((5, 5), np.uint8)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+
+        red_area_pixels = np.sum(red_mask > 0)
+        total_pixels = frame.shape[0] * frame.shape[1]
+        red_area_ratio = red_area_pixels / total_pixels
+
+        return red_mask, red_area_pixels, red_area_ratio
+
+    def compute_change_over_time(self, current_red_area):
+        """
+        4) Compute change in red area over time.
+        Since we process at 1 fps, 2 seconds = 2 frames.
+        """
+
+        self.red_area_history.append(current_red_area)
+
+        percent_change = 0.0
+
+        # Need at least 3 sampled frames to compare current frame to 2 seconds ago
+        if len(self.red_area_history) >= 3:
+            red_area_2_seconds_ago = self.red_area_history[-3]
+
+            if red_area_2_seconds_ago > 0:
+                percent_change = (
+                    current_red_area - red_area_2_seconds_ago
+                ) / red_area_2_seconds_ago
+
+        return percent_change
+
+    # def calculate_severity_score(self, red_area_ratio, percent_change):
+    #     """
+    #     Optional severity score based on:
+    #     - how much red is visible
+    #     - how quickly the red area is expanding
+    #     """
+    #
+    #     area_score = min(red_area_ratio / 0.10, 1.0)
+    #     growth_score = min(max(percent_change, 0) / 0.50, 1.0)
+    #
+    #     severity_score = (0.6 * area_score) + (0.4 * growth_score)
+    #
+    #     if severity_score < 0.25:
+    #         severity = "low"
+    #     elif severity_score < 0.60:
+    #         severity = "medium"
+    #     else:
+    #         severity = "high"
+    #
+    #     return severity_score, severity
+
+    def process_frame(self, frame, frame_number):
+        red_mask, red_area_pixels, red_area_ratio = self.detect_red_area(frame)
+
+        percent_change = self.compute_change_over_time(red_area_pixels)
+
+        # Optional severity score
+        # severity_score, severity = self.calculate_severity_score(
+        #     red_area_ratio,
+        #     percent_change
+        # )
+
+        # 5) Trigger bleeding alert if red area increases by >30% in 2 seconds
+        bleeding_alert = (
+            percent_change > self.increase_threshold
+            and red_area_ratio > self.min_red_area_ratio
+        )
+
+        alert_data = {
+            "timestamp": datetime.now().isoformat(),
+            "frame_number": int(frame_number),
+            "red_area_pixels": int(red_area_pixels),
+            "red_area_ratio": round(float(red_area_ratio), 4),
+            "percent_change_over_2_seconds": round(float(percent_change), 4),
+            # "severity_score": round(float(severity_score), 4),
+            # "severity": severity,
+            "bleeding_alert": bool(bleeding_alert)
+        }
+
+        output_frame = self.draw_overlay(
+            frame,
+            red_mask,
+            red_area_pixels,
+            red_area_ratio,
+            percent_change,
+            # severity,
+            bleeding_alert
+        )
+
+        return output_frame, alert_data
+
+    def draw_overlay(
+        self,
+        frame,
+        red_mask,
+        red_area_pixels,
+        red_area_ratio,
+        percent_change,
+        # severity,
+        bleeding_alert
+    ):
+        output = frame.copy()
+
+        contours, _ = cv2.findContours(
+            red_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area > 100:
+                x, y, w, h = cv2.boundingRect(contour)
+                cv2.rectangle(output, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+        # Only show text if there is a bleeding alert
+        if bleeding_alert:
+            cv2.putText(
+                output,
+                "BLEEDING ALERT",
+                (15, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 255),
+                1
+            )
+
+        # Smaller overlay text
+        cv2.putText(
+            output,
+            f"Red area: {red_area_pixels} px",
+            (15, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1
+        )
+
+        cv2.putText(
+            output,
+            f"Red ratio: {red_area_ratio:.3f}",
+            (15, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1
+        )
+
+        cv2.putText(
+            output,
+            f"2-sec change: {percent_change * 100:.1f}%",
+            (15, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1
+        )
+
+        # Optional severity overlay
+        # cv2.putText(
+        #     output,
+        #     f"Severity: {severity}",
+        #     (15, 110),
+        #     cv2.FONT_HERSHEY_SIMPLEX,
+        #     0.35,
+        #     (255, 255, 255),
+        #     1
+        # )
+
+        return output
+
+
+def run_bleeding_detector(input_video_path):
+    detector = BleedingDetectorNoPyTorch()
+
+    cap = cv2.VideoCapture(input_video_path)
+
+    if not cap.isOpened():
+        print("ERROR: Could not open video.")
+        print("Check that the video file is in the same folder as this Python file.")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if fps == 0:
+        fps = 30
+
+    # Output files
+    output_video_path = "bleeding_output.mp4"
+    output_json_path = "bleeding_alerts.json"
+
+    width = 224
+    height = 224
+
+    # MP4 output
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    output_video = cv2.VideoWriter(
+        output_video_path,
+        fourcc,
+        1,
+        (width, height)
+    )
+
+    if not output_video.isOpened():
+        print("ERROR: Could not create output video.")
+        return
+
+    alerts = []
+    frame_number = 0
+    sampled_frame_count = 0
+
+    print("Processing video at 1 fps...")
+    print("------------------------------------")
+
+    while True:
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        # Extract 1 frame per second
+        if frame_number % int(fps) == 0:
+            frame = cv2.resize(frame, (224, 224))
+
+            output_frame, alert_data = detector.process_frame(
+                frame,
+                frame_number
+            )
+
+            alerts.append(alert_data)
+            output_video.write(output_frame)
+
+            if alert_data["bleeding_alert"]:
+                status = "BLEEDING ALERT"
+            else:
+                status = "No bleeding alert"
+
+            print(
+                f"Frame {sampled_frame_count} | "
+                f"Original Frame {frame_number} | "
+                f"Red Area: {alert_data['red_area_pixels']} pixels | "
+                f"Red Ratio: {alert_data['red_area_ratio']} | "
+                f"2-sec Change: {alert_data['percent_change_over_2_seconds'] * 100:.2f}% | "
+                # f"Severity: {alert_data['severity']} | "
+                f"Status: {status}"
+            )
+
+            sampled_frame_count += 1
+
+        frame_number += 1
+
+    cap.release()
+    output_video.release()
+
+    with open(output_json_path, "w") as file:
+        json.dump(alerts, file, indent=2)
+
+    print("------------------------------------")
+    print("Done.")
+    print("Frames analyzed:", sampled_frame_count)
+    print("Output video:", output_video_path)
+    print("Output JSON:", output_json_path)
+
+
+# Change this to your exact video filename
+run_bleeding_detector("liver.mp4")
