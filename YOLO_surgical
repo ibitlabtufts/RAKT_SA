@@ -1,0 +1,265 @@
+import json
+from pathlib import Path
+from PIL import Image
+import shutil
+import random
+from ultralytics import YOLO
+
+# -------------------------------
+# CONFIGURATION
+# -------------------------------
+
+# Folder containing your images + LabelMe .json files
+DATA_FOLDER = Path("surgical_dataset_unlabeled")
+
+# Output folders
+OUTPUT_LABEL_FOLDER = Path("yolo_labels")
+OUTPUT_DATASET_FOLDER = Path("surgical_yolo_dataset")
+
+# Class order for YOLO
+CLASS_NAMES = ["needle_tip", "clamp"]
+
+# Training parameters
+EPOCHS = 150
+IMAGE_SIZE = 960
+BATCH_SIZE = 2
+MODEL_NAME = "yolov8s.pt"
+TRAINING_NAME = "surgical_instrument_detector_better"
+
+# Validation split ratio (20% for validation)
+VAL_RATIO = 0.2
+RANDOM_SEED = 42
+
+
+# -------------------------------
+# STEP 1: CONVERT LABELME TO YOLO
+# -------------------------------
+
+def convert_rectangle_to_yolo(points, image_width, image_height):
+    """
+    Converts LabelMe rectangle points to YOLO format.
+    LabelMe rectangle: two corner points [[x1, y1], [x2, y2]]
+    YOLO format: x_center y_center width height (normalized 0-1)
+    """
+    x_values = [p[0] for p in points]
+    y_values = [p[1] for p in points]
+
+    x_min, x_max = min(x_values), max(x_values)
+    y_min, y_max = min(y_values), max(y_values)
+
+    box_width = x_max - x_min
+    box_height = y_max - y_min
+
+    x_center = x_min + box_width / 2
+    y_center = y_min + box_height / 2
+
+    return (
+        x_center / image_width,
+        y_center / image_height,
+        box_width / image_width,
+        box_height / image_height
+    )
+
+
+def find_image_for_json(json_path, data):
+    """Finds the matching image for a LabelMe JSON file."""
+    image_name = data.get("imagePath", "")
+    image_path = DATA_FOLDER / image_name
+
+    if image_path.exists():
+        return image_path
+
+    # Fallback: find image with same stem as json file
+    for extension in [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]:
+        possible = DATA_FOLDER / f"{json_path.stem}{extension}"
+        if possible.exists():
+            return possible
+
+    return None
+
+
+def convert_labelme_to_yolo():
+    """Converts all LabelMe JSON files to YOLO format."""
+    OUTPUT_LABEL_FOLDER.mkdir(exist_ok=True)
+    
+    json_files = sorted(DATA_FOLDER.glob("*.json"))
+    print(f"Found {len(json_files)} JSON files to convert...")
+
+    if len(json_files) == 0:
+        print("No LabelMe JSON files found. Check your data folder!")
+        return False
+
+    converted_count = 0
+    for json_path in json_files:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+
+        image_path = find_image_for_json(json_path, data)
+        if image_path is None:
+            print(f"Could not find image for: {json_path.name}")
+            continue
+
+        image = Image.open(image_path)
+        image_width, image_height = image.size
+
+        yolo_lines = []
+        for shape in data.get("shapes", []):
+            label = shape.get("label", "")
+            shape_type = shape.get("shape_type", "")
+
+            if label not in CLASS_NAMES:
+                print(f"Skipping unknown label '{label}' in {json_path.name}")
+                continue
+
+            if shape_type != "rectangle":
+                print(f"Skipping non-rectangle shape in {json_path.name}")
+                continue
+
+            class_id = CLASS_NAMES.index(label)
+            x_center, y_center, width, height = convert_rectangle_to_yolo(
+                shape["points"], image_width, image_height
+            )
+
+            yolo_lines.append(
+                f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+            )
+
+        if yolo_lines:  # Only save if we have annotations
+            output_path = OUTPUT_LABEL_FOLDER / f"{json_path.stem}.txt"
+            with open(output_path, "w") as f:
+                f.write("\n".join(yolo_lines))
+            converted_count += 1
+            print(f"Converted: {json_path.name}")
+
+    print(f"Converted {converted_count} JSON files to YOLO format")
+    return True
+
+
+# -------------------------------
+# STEP 2: CREATE YOLO DATASET
+# -------------------------------
+
+def create_yolo_dataset():
+    """Organizes images and labels into train/val splits and creates dataset YAML."""
+    
+    # Create folder structure
+    for split in ["train", "val"]:
+        (OUTPUT_DATASET_FOLDER / "images" / split).mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DATASET_FOLDER / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    # Find all images
+    image_paths = []
+    for ext in ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]:
+        image_paths.extend(DATA_FOLDER.glob(ext))
+
+    if not image_paths:
+        print("No images found in data folder!")
+        return False
+
+    # Match images with labels
+    pairs = []
+    for image_path in image_paths:
+        label_path = OUTPUT_LABEL_FOLDER / f"{image_path.stem}.txt"
+        if label_path.exists():
+            pairs.append((image_path, label_path))
+
+    if not pairs:
+        print("No matching image-label pairs found!")
+        return False
+
+    print(f"Found {len(pairs)} image-label pairs")
+
+    # Split into train/val
+    random.seed(RANDOM_SEED)
+    random.shuffle(pairs)
+
+    val_count = max(1, int(len(pairs) * VAL_RATIO))
+    val_pairs = pairs[:val_count]
+    train_pairs = pairs[val_count:]
+
+    print(f"Train: {len(train_pairs)}, Val: {len(val_pairs)}")
+
+    # Copy files
+    def copy_pairs(pairs, split):
+        for image_path, label_path in pairs:
+            shutil.copy(image_path, OUTPUT_DATASET_FOLDER / "images" / split / image_path.name)
+            shutil.copy(label_path, OUTPUT_DATASET_FOLDER / "labels" / split / label_path.name)
+
+    copy_pairs(train_pairs, "train")
+    copy_pairs(val_pairs, "val")
+
+    # Create dataset YAML
+    yaml_text = f"""# YOLO dataset configuration
+path: {OUTPUT_DATASET_FOLDER.resolve()}
+train: images/train
+val: images/val
+
+nc: {len(CLASS_NAMES)}
+names: {CLASS_NAMES}
+"""
+
+    yaml_path = OUTPUT_DATASET_FOLDER / "surgical_dataset.yaml"
+    with open(yaml_path, "w") as f:
+        f.write(yaml_text)
+
+    print(f"Dataset created at: {OUTPUT_DATASET_FOLDER}")
+    print(f"YAML saved at: {yaml_path}")
+    return True
+
+
+# -------------------------------
+# STEP 3: TRAIN YOLO MODEL
+# -------------------------------
+
+def train_yolo_model():
+    """Trains YOLO model on the prepared dataset."""
+    yaml_path = OUTPUT_DATASET_FOLDER / "surgical_dataset.yaml"
+    
+    if not yaml_path.exists():
+        print("Dataset YAML not found. Run dataset creation first!")
+        return False
+
+    print("Starting YOLO training...")
+    model = YOLO(MODEL_NAME)
+    
+    results = model.train(
+        data=str(yaml_path),
+        epochs=EPOCHS,
+        imgsz=IMAGE_SIZE,
+        batch=BATCH_SIZE,
+        name=TRAINING_NAME
+    )
+    
+    print(f"Training complete! Results saved in runs/detect/{TRAINING_NAME}")
+    return True
+
+
+# -------------------------------
+# MAIN PIPELINE
+# -------------------------------
+
+def main():
+    """Run the complete pipeline."""
+    print("=" * 60)
+    print("SURGICAL INSTRUMENT DETECTION PIPELINE")
+    print("=" * 60)
+    
+    # Step 1: Convert LabelMe to YOLO
+    print("\nSTEP 1: Converting LabelMe annotations...")
+    if not convert_labelme_to_yolo():
+        print("Conversion failed. Exiting...")
+        return
+    
+    # Step 2: Create YOLO dataset
+    print("\nSTEP 2: Creating YOLO dataset...")
+    if not create_yolo_dataset():
+        print("Dataset creation failed. Exiting...")
+        return
+    
+    # Step 3: Train YOLO model
+    print("\nSTEP 3: Training YOLO model...")
+    train_yolo_model()
+    
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE!")
+    print("=" * 60)
